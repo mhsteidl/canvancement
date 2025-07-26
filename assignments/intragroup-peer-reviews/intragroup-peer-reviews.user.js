@@ -1,371 +1,230 @@
 // ==UserScript==
-// @name        IntraGroup Peer Reviews
-// @description Assign intra-group peer reviews
-// @namespace   https://github.com/jamesjonesmath/canvancement
-// @match       https://*.instructure.com/courses/*/assignments/*/peer_reviews
-// @require     https://cdn.jsdelivr.net/npm/bottleneck@2/light.min.js
-// @version     3
-// @grant       none
+// @name         IntraGroup Peer Reviews
+// @namespace    https://github.com/yourname/canvas-peer-review
+// @version      4
+// @description  Assign peer reviews within groups on Canvas using the same endpoint as the web UI. Works even if students haven't submitted yet.
+// @match        https://*.instructure.com/courses/*/assignments/*/peer_reviews
+// @grant        none
+// @author       @mhsteidl
 // ==/UserScript==
-/* global Bottleneck */
+
+// @thanks       Massive thanks to James Jones (@jamesjonesmath) for creating the original version of this script.
+//               His work laid the foundation for making Canvas peer review assignments more flexible and powerful.
+//               This version builds upon his contributions with deep appreciation and respect for the original.
+
 
 (function () {
-  'use strict';
-  const reloadPageWhenFinished = true;
-  const debug = false;
-  let courseId = null;
-  let assignmentId = null;
-  let groupSets = null;
-  const pageRegex = new RegExp(
-    '^/courses/([0-9]+)/assignments/([0-9]+)/peer_reviews$'
-  );
-  const pageMatches = pageRegex.exec(window.location.pathname);
+    'use strict';
 
-  let limiter = null;
-  if (typeof Bottleneck === 'function') {
-    limiter = new Bottleneck({
-      maxConcurrent: 10,
-      minTime: 20,
-    });
-  }
-  const fetch = limiter ? limiter.wrap(window.fetch) : window.fetch;
+    // Extract course and assignment ID from the URL
+    const [ , courseId, assignmentId ] = window.location.pathname.match(/\/courses\/(\d+)\/assignments\/(\d+)\/peer_reviews/) || [];
+    if (!courseId || !assignmentId) return; // Exit if not on a matching page
 
-  if (pageMatches) {
-    courseId = pageMatches[1];
-    assignmentId = pageMatches[2];
-    getJson(`/api/v1/courses/${courseId}/group_categories?per_page=50`).then(
-      v => {
-        if (!v || v.length === 0) {
-          return;
-        }
-        if (v.length === 1) {
-          groupSets = v;
-          addDialog(v[0].id);
-        } else {
-          groupSets = sortEmbeddedNumeric(v, 'name');
-          checkGroupAssignment();
-        }
-      }
-    );
-  }
-
-  function checkGroupAssignment() {
-    getJson(`/api/v1/courses/${courseId}/assignments/${assignmentId}`).then(
-      v => {
-        addDialog(v.group_category_id);
-      }
-    );
-  }
-
-  function sortEmbeddedNumeric(data, keyField) {
-    const numberRegex = new RegExp('([0-9]+)', 'g');
-    for (let i = 0; i < data.length; i++) {
-      data[i].paddedKey = data[i][keyField].replace(
-        numberRegex,
-        (match, p1, offset, string) => {
-          const padded = '0000' + match;
-          return padded.substr(-5);
-        }
-      );
+    // Attempt to read the CSRF token from cookies
+    const csrfToken = document.cookie.match(/_csrf_token=([^;]+)/)?.[1];
+    if (!csrfToken) {
+        alert("CSRF token not found. Please make sure you're logged into Canvas.");
+        return;
     }
-    data.sort((a, b) => a.paddedKey.localeCompare(b.paddedKey));
-    return data;
-  }
 
-  function addDialog(assignmentGroupId) {
-    if (typeof groupSets === 'undefined' || groupSets.length === 0) {
-      return;
-    }
-    const parent = document.querySelector(
-      'div#right-side-wrapper aside#right-side'
-    );
-    if (!parent) {
-      return;
-    }
-    const el = document.createElement('div');
-    el.id = 'jj_intragroup';
-    const heading = document.createElement('h3');
-    heading.textContent = 'Intra-Group Reviews';
-    el.appendChild(heading);
-    const intro = document.createElement('div');
-    intro.textContent =
-      'This will assign reviews to other people in the same group.' +
-      (reloadPageWhenFinished
-        ? ' If any peer reviews are assigned, this page will reload when finished.'
-        : '');
-    el.appendChild(intro);
-    const select = document.createElement('select');
-    select.id = 'jj_intragroup_select';
-    const defaultGroupSetId = assignmentGroupId ? assignmentGroupId : false;
-    select.add(
-      new Option('Choose a Group Set', 0, defaultGroupSetId === false)
-    );
-    for (let i = 0; i < groupSets.length; i++) {
-      const item = groupSets[i];
-      const groupSetId = item.id;
-      const isSelected = defaultGroupSetId && defaultGroupSetId == groupSetId;
-      select.add(new Option(item.name, groupSetId, isSelected, isSelected));
-    }
-    el.appendChild(select);
-    const buttonDiv = document.createElement('div');
-    buttonDiv.classList.add(
-      'button-container',
-      'button-container-right-aligned'
-    );
-    const button = document.createElement('button');
-    button.id = 'jj_intragroup_button';
-    button.classList.add('btn');
-    button.textContent = 'Assign IntraGroup Reviews';
-    button.addEventListener('click', assignGroups, {
-      once: true,
-    });
-    buttonDiv.appendChild(button);
-    const progress = document.createElement('progress');
-    progress.id = 'jj_intragroup_progress';
-    progress.style.cssText = 'width: 90%; display: none; height: 2em;';
-    buttonDiv.appendChild(progress);
-    el.appendChild(buttonDiv);
-    parent.appendChild(el);
-  }
-
-  function assignGroups() {
-    const el = document.getElementById('jj_intragroup_select');
-    if (!el) {
-      return;
-    }
-    const selectedItems = el.selectedOptions;
-    if (selectedItems.length !== 1 || selectedItems[0].value == 0) {
-      return;
-    }
-    const button = document.getElementById('jj_intragroup_button');
-    button.style.display = 'none';
-    updateProgressBar();
-    const groupSetId = selectedItems[0].value;
-    getJson(`/api/v1/group_categories/${groupSetId}/groups?per_page=50`).then(
-      processGroups
-    );
-  }
-
-  function processGroups(groupList) {
-    const groupIds = groupList.map(group => group.id);
-    const p = groupIds.map(groupId =>
-      getJson(`/api/v1/groups/${groupId}/users`)
-    );
-    Promise.all(p).then(values => {
-      const groups = [];
-      for (let i = 0; i < groupIds.length; i++) {
-        groups.push({
-          id: groupIds[i],
-          users: values[i].map(user => user.id),
+    /**
+     * Fetches and parses a JSON response from the Canvas API.
+     * Uses same-origin credentials and handles non-OK responses.
+     */
+    const fetchJSON = async (url) => {
+        const res = await fetch(url, {
+            headers: { 'Accept': 'application/json' },
+            credentials: 'same-origin'
         });
-      }
-      addReviews(groups);
-    });
-  }
+        if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
+        return res.json();
+    };
 
-  function addReviews(groups) {
-    const adds = computeNeeds(groups);
-    if (adds.length) {
-      updateProgressBar(0);
-      const n = adds.length;
-      let completed = 0;
-      const csrfToken = getCookie('_csrf_token');
-      const pl = adds.map(add => {
-        const userId = add.userId;
-        const reviews = add.reviews;
-        const url = `/courses/${courseId}/assignments/${assignmentId}/peer_reviews/users/${userId}`;
-        const p = reviews.map(revieweeId => {
-          const data = {
-            reviewee_id: revieweeId,
+    /**
+     * Sends a peer review assignment request using Canvas's internal endpoint.
+     * This mimics the web UI and works even if the reviewee hasn't submitted.
+     * Parameters:
+     * - revieweeId: the user who will be reviewed
+     * - assessorId: the user who will perform the review
+     */
+    const postPeerReview = async (revieweeId, assessorId) => {
+        const url = `/courses/${courseId}/assignments/${assignmentId}/peer_reviews/users/${assessorId}`;
+
+        // Get a fresh CSRF token from meta or hidden input field
+        const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content ||
+              document.querySelector('input[name="authenticity_token"]')?.value;
+
+        // Canvas expects URL-encoded form data, not JSON
+        const formBody = new URLSearchParams({
+            utf8: '✓',
             authenticity_token: csrfToken,
-          };
-          return postData(url, data);
+            reviewee_id: revieweeId,
+            _method: 'post'
         });
-        return Promise.all(p).then(() => {
-          completed++;
-          updateProgressBar(completed / n);
-          return Promise.resolve(true);
+
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Accept': 'application/json',
+            },
+            credentials: 'same-origin',
+            body: formBody.toString()
         });
-      });
-      Promise.all(pl).then(() => {
-        updateProgressBar(1);
-        if (reloadPageWhenFinished && completed >= n) {
-          window.location.reload();
-        }
-      });
-    }
-  }
 
-  function updateProgressBar(x) {
-    const progress = document.getElementById('jj_intragroup_progress');
-    if (progress) {
-      if (typeof x !== 'undefined') {
-        progress.value = x;
-        progress.textContent = `${Math.round(x * 100)}%`;
-      }
-      if (typeof x === 'undefined' || x === 0) {
-        progress.style.display = 'inline-block';
-      } else if (x === 1) {
-        progress.style.display = 'none';
-      }
-    }
-  }
-
-  function computeNeeds(groups) {
-    const existing = getUsers();
-    const adds = [];
-    for (let i = 0; i < groups.length; i++) {
-      const users = groups[i].users;
-      for (let j = 0; j < users.length; j++) {
-        const userId = users[j];
-        if (typeof existing[userId] === 'undefined') {
-          continue;
-        }
-        const existingReviews = existing[userId];
-        const reviews = [];
-        for (let k = 0; k < users.length; k++) {
-          if (j === k || typeof existing[users[k]] === 'undefined') {
-            continue;
-          }
-          const dstUser = users[k];
-          if (existingReviews.indexOf(dstUser) === -1) {
-            reviews.push(dstUser);
-          }
-        }
-        if (reviews.length) {
-          adds.push({
-            userId: userId,
-            reviews: reviews,
-          });
-        }
-      }
-    }
-    return adds;
-  }
-
-  function getUsers() {
-    const users = {};
-    const studentList = document.querySelectorAll(
-      '#content ul li.student_reviews'
-    );
-    if (studentList.length > 0) {
-      for (let i = 0; i < studentList.length; i++) {
-        const item = studentList[i];
-        const userSpan = item.querySelector('a span.user_id.student_review_id');
-        if (userSpan) {
-          const userId = userSpan.textContent;
-          const reviews = [];
-          const assignedList = item.querySelectorAll(
-            'ul.peer_reviews li.peer_review.assigned'
-          );
-          if (assignedList) {
-            for (let j = 0; j < assignedList.length; j++) {
-              const assignSpan = assignedList[j].querySelector('span.user_id');
-              if (assignSpan) {
-                const assigneeId = parseInt(assignSpan.textContent, 10);
-                reviews.push(assigneeId);
-              }
-            }
-          }
-          users[userId] = reviews;
-        }
-      }
-    }
-    return users;
-  }
-
-  function getCookie(name) {
-    const cookies = document.cookie.split(';').map(cookie => cookie.trim());
-    let cookieValue = null;
-    let i = 0;
-    while (i < cookies.length && cookieValue === null) {
-      const cookie = cookies[i].split('=', 2);
-      if (cookie[0] === name) {
-        cookieValue = decodeURIComponent(cookie[1]);
-      }
-      i++;
-    }
-    return cookieValue;
-  }
-
-  function postData(url, data) {
-    const init = {
-      credentials: 'same-origin',
-      headers: new Headers({
-        'content-type': 'application/json',
-        'accept': 'application/json',
-      }),
-      method: 'POST',
-      body: JSON.stringify(data),
-    };
-    return fetch(url, init)
-      .then(res => displayLimits(res, url))
-      .then(response => response.json());
-  }
-
-  function getJson(url) {
-    const init = {
-      credentials: 'same-origin',
-      headers: new Headers({
-        'content-type': 'application/json',
-        'accept': 'application/json',
-      }),
-    };
-    return fetch(url, init)
-      .then(res => displayLimits(res, url))
-      .then(response => {
-        const links = checkLinkHeader(response.headers.get('link'));
-        if (typeof links !== 'undefined' && links.length) {
-          const promises = links.map(u => getJson(u));
-          promises.unshift(response.json());
-          return Promise.all(promises).then(values => {
-            const data = [];
-            values.map(v => Array.prototype.push.apply(data, v));
-            return data;
-          });
+        // Log result to console for debugging
+        if (!res.ok) {
+            const errorText = await res.text();
+            console.error(`❌ Failed: reviewer ${assessorId} → reviewee ${revieweeId}`, errorText);
         } else {
-          return response.json();
+            console.log(`✅ Assigned: reviewer ${assessorId} → reviewee ${revieweeId}`);
         }
-      })
-      .catch(e => new Error(e));
-  }
+    };
 
-  function checkLinkHeader(hdrText) {
-    if (typeof hdrText !== 'string') {
-      return;
-    }
-    const linkHeaderRegex = new RegExp('<([^>]+)>; rel="(next|last)"', 'g');
-    const links = {};
-    const urls = [];
-    let link = null;
-    while ((link = linkHeaderRegex.exec(hdrText)) !== null) {
-      const linkType = link[2];
-      links[linkType] = new URL(link[1]);
-    }
-    if (typeof links.next !== 'undefined') {
-      if (links.next.searchParams.has('page')) {
-        const a = parseInt(links.next.searchParams.get('page'), 10);
-        if (a === 2 && typeof links.last !== 'undefined') {
-          const b = parseInt(links.last.searchParams.get('page'), 10);
-          for (let i = a; i <= b; i++) {
-            links.next.searchParams.set('page', i);
-            urls.push(links.next.toString());
-          }
+    /**
+     * Builds and injects the sidebar UI that allows users to select a group set
+     * and trigger intra-group peer review assignment.
+     */
+    const createUI = async () => {
+        const sidebar = document.querySelector('#right-side-wrapper aside#right-side');
+        if (!sidebar || document.getElementById('peer-review-tool')) return; // Avoid duplicate UI
+
+        const container = document.createElement('div');
+        container.id = 'peer-review-tool';
+        container.classList.add('ic-teacher-sidebar-module');
+        container.innerHTML = `
+            <h3>Intra-Group Reviews</h3>
+            <p>Assign all-to-all reviews within each group.</p>
+            <select id="group-set-select" style="width: 100%; margin-bottom: 8px;"></select>
+            <button class="btn" id="assign-reviews-btn">Assign Reviews</button>
+            <progress id="intragroup_progress" style="width: 90%; display: none; height: 2em;"></progress>
+            <div id="peer-review-log" style="margin-top: 8px; font-size: 0.9em;"></div>
+        `;
+        sidebar.appendChild(container);
+
+        const groupSets = await fetchJSON(`/api/v1/courses/${courseId}/group_categories?per_page=100`);
+        const select = document.getElementById('group-set-select');
+
+        if (groupSets.length === 1) {
+            // Auto-select the only group set if there is just one
+            const onlySet = groupSets[0];
+            select.add(new Option(onlySet.name, onlySet.id, true, true));
+        } else {
+            // For multiple sets, add a default option and list all
+            select.add(new Option('Choose a group set', ''));
+            groupSets.forEach(set => {
+                select.add(new Option(set.name, set.id));
+            });
         }
-      }
-      if (urls.length === 0) {
-        urls.push(links.next.toString());
-      }
-    }
-    return urls;
-  }
 
-  function displayLimits(res, url) {
-    if (debug) {
-      const rate = res.headers.get('X-Rate-Limit-Remaining');
-      const runtime = res.headers.get('X-Runtime');
-      console.log(`${rate}\t${runtime}\t${res.status}\t${url}`);
+        // Set up button click to trigger peer review assignment
+        document.getElementById('assign-reviews-btn').addEventListener('click', async () => {
+            const selectedGroupSetId = select.value;
+            if (!selectedGroupSetId) {
+                alert('Please select a group set.');
+                return;
+            }
+            await assignIntragroupReviews(selectedGroupSetId);
+        });
+    };
+
+    /**
+     * Updates the progress bar based on a completion ratio.
+     * @param {number|undefined} x - A number from 0 to 1 (progress), or undefined for indeterminate
+     */
+    function updateProgressBar(x) {
+        const progress = document.getElementById('intragroup_progress');
+        if (!progress) return;
+
+        if (typeof x === 'undefined') { // Indeterminate state
+            progress.removeAttribute('value');
+            progress.style.display = 'inline-block';
+        } else if (x >= 0 && x < 1) { // Show progress
+            progress.value = x;
+            progress.textContent = `${Math.round(x * 100)}%`;
+            progress.style.display = 'inline-block';
+        } else { // Hide when done
+            progress.style.display = 'none';
+        }
     }
-    return Promise.resolve(res);
-  }
+
+    /**
+     * Main function that:
+     * - Fetches groups and members
+     * - Checks for existing peer reviews
+     * - Assigns all-to-all reviews within each group
+     * - Displays progress and logs completion
+     * @param {string} groupSetId - ID of the selected group set
+     */
+    const assignIntragroupReviews = async (groupSetId) => {
+        const log = document.getElementById('peer-review-log');
+        log.textContent = 'Fetching group data...';
+
+        const groups = await fetchJSON(`/api/v1/group_categories/${groupSetId}/groups?per_page=100`);
+        const peerReviews = await fetchJSON(`/api/v1/courses/${courseId}/assignments/${assignmentId}/peer_reviews?per_page=100`);
+
+        // Build a Set of already-assigned reviews
+        const existing = new Set(peerReviews.map(r => `${r.assessor_id}:${r.user_id}`));
+        const assignments = [];
+
+        // Create a list of new reviewer-reviewee pairs to assign
+        for (const group of groups) {
+            const members = await fetchJSON(`/api/v1/groups/${group.id}/users?per_page=100`);
+            const ids = members.map(u => u.id);
+
+            for (const assessor of ids) {
+                for (const reviewee of ids) {
+                    if (assessor === reviewee) continue; // Skip self-review
+                    const key = `${assessor}:${reviewee}`;
+                    if (!existing.has(key)) {
+                        assignments.push([reviewee, assessor]);
+                    }
+                }
+            }
+        }
+
+        const total = assignments.length;
+        if (total === 0) {
+            log.textContent = '✅ No new peer reviews needed. All already assigned.';
+            updateProgressBar(1);
+            return;
+        }
+
+        log.textContent = `Assigning ${total} peer reviews...`;
+        updateProgressBar(0);
+
+        let completed = 0;
+        const concurrency = 20; // Max number of simultaneous review POSTs
+
+        // Function to update the progress bar and UI after each assignment
+        const updateProgress = () => {
+            completed++;
+            updateProgressBar(completed / total);
+            log.textContent = `Assigned ${completed} of ${total} reviews...`;
+        };
+
+        /**
+         * Executes a batch of peer review assignments in parallel.
+         * Uses Promise.allSettled to ensure all results are handled.
+         */
+        const executeBatch = async (batch) => {
+            await Promise.allSettled(
+                batch.map(([reviewee, assessor]) =>
+                    postPeerReview(reviewee, assessor).finally(updateProgress)
+                )
+            );
+        };
+
+        // Run assignments in batches to avoid overloading Canvas API
+        for (let i = 0; i < assignments.length; i += concurrency) {
+            const batch = assignments.slice(i, i + concurrency);
+            await executeBatch(batch);
+        }
+
+        updateProgressBar(1);
+        log.textContent = `✅ Done. ${total} reviews assigned. Reload the page to verify.`;
+    };
+
+    // Automatically create the sidebar UI when the page loads
+    createUI();
 })();
